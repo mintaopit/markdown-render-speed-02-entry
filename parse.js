@@ -169,7 +169,9 @@ function isBlankLine(s) {
 
 // Escape for code spans / code blocks: every special char is escaped.
 const CODE_ESC_RE = /[&<>"']/g;
+const NEED_ESC_RE = /[&<>"']/;
 function escCode(s) {
+  if (!NEED_ESC_RE.test(s)) return s;
   return s.replace(CODE_ESC_RE, (c) => {
     switch (c) {
       case '&': return '&amp;';
@@ -188,6 +190,7 @@ function escCode(s) {
 // through verbatim, only numeric ones are decoded.
 const TEXT_ESC_RE = /&(?:#([0-9]+)|#[xX]([0-9a-fA-F]+)|([A-Za-z][A-Za-z0-9]*));|[&<>"']/g;
 function escText(s) {
+  if (!NEED_ESC_RE.test(s)) return s;
   return s.replace(TEXT_ESC_RE, (m, dec, hex, name) => {
     if (name !== undefined) return m;
     if (dec !== undefined || hex !== undefined) {
@@ -215,7 +218,8 @@ function escText(s) {
 // marked's URL cleaning: encodeURI, keeping %XX sequences intact.
 function cleanUrl(href) {
   try {
-    return encodeURI(href).replace(/%25/g, '%');
+    const u = encodeURI(href);
+    return u.indexOf('%25') < 0 ? u : u.replace(/%25/g, '%');
   } catch (e) {
     return null;
   }
@@ -356,6 +360,13 @@ function parseLinkLabel(s, j) {
 // Normalize a link label for lookup: collapse whitespace to single
 // spaces, trim, lowercase.
 function normalizeLabel(label) {
+  // Fast path: pure ASCII, already lowercase, no whitespace — the
+  // fold map, collapse, trim and case fold are all identities.
+  if (!/[A-Z\s\x80-\uFFFF]/.test(label)) return label;
+  // No fold characters: skip the per-character fold loop entirely.
+  if (!/[\u1E9E\u00DF\uFB00-\uFB06]/.test(label)) {
+    return label.replace(/\s+/g, ' ').trim().toLowerCase();
+  }
   // Unicode case folding: the sharp s and ligatures fold to multiple
   // letters, which toLowerCase() alone does not do ('ẞ' -> 'ß', not 'ss').
   let s = '';
@@ -656,7 +667,9 @@ function matchFence(s, base) {
 function matchHr(s, base) {
   const ind = indentCols(s, base);
   if (ind.col - (base || 0) > 3) return null;
-  const t = s.slice(ind.i).replace(/[ \t]+$/, '');
+  let t = s.slice(ind.i);
+  const last = t.charCodeAt(t.length - 1);
+  if (last === 32 || last === 9) t = t.replace(/[ \t]+$/, '');
   if (t.length < 3) return false;
   const c = t[0];
   if (c !== '-' && c !== '_' && c !== '*') return false;
@@ -678,6 +691,15 @@ function matchSetext(s, base) {
 
 // Does this line start a block that can interrupt a paragraph?
 function startsInterruptBlock(s, base) {
+  // Fast pre-gate: every matcher below requires indent <= 3 and a
+  // first non-space char from this set, so ordinary prose lines skip
+  // all six matcher calls (each re-scans the indent + regexes).
+  const ind = indentCols(s, base);
+  if (ind.col - (base || 0) > 3) return false;
+  const fc = s[ind.i];
+  if (fc !== '#' && fc !== '`' && fc !== '~' && fc !== '-' && fc !== '_' &&
+      fc !== '*' && fc !== '>' && fc !== '<' && fc !== '+' &&
+      !(fc >= '0' && fc <= '9')) return false;
   if (matchAtx(s, base)) return true;
   if (matchFence(s, base)) return true;
   if (matchHr(s, base)) return true;
@@ -736,7 +758,7 @@ function newBlock(type) {
 // ---------------------------------------------------------------------------
 
 export function parseBlocks(src) {
-  src = src.replace(/\r\n?/g, '\n');
+  if (src.indexOf('\r') >= 0) src = src.replace(/\r\n?/g, '\n');
   const srcEndsNl = src.endsWith('\n');
   const lines = src.split('\n');
   if (lines.length && lines[lines.length - 1] === '') lines.pop();
@@ -1338,11 +1360,27 @@ export function parseBlocks(src) {
 // {t:'img',src,alt,title}, {t:'em'|'strong'|'del',children:[items]}.
 
 const UNI_PUNCT_RE = /^[\p{P}\p{S}]$/u;
+// Fast paths: ASCII is decided by char code (no regex); the unicode
+// property regex only runs for non-ASCII characters. \s in JS is
+// [\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff].
 function isUniPunct(ch) {
-  return ch.length === 1 && (PUNCT.indexOf(ch) >= 0 || UNI_PUNCT_RE.test(ch));
+  if (ch.length !== 1) return false;
+  const c = ch.charCodeAt(0);
+  if (c < 128) return PUNCT.indexOf(ch) >= 0;
+  return UNI_PUNCT_RE.test(ch);
 }
 function isUniSpace(ch) {
-  return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || /\s/.test(ch);
+  const c = ch.charCodeAt(0);
+  return c === 32 || (c >= 9 && c <= 13) || c === 160 || c === 5760 ||
+    (c >= 8192 && c <= 8202) || c === 8232 || c === 8233 || c === 8239 ||
+    c === 8287 || c === 12288 || c === 65279;
+}
+// ASCII alnum / alnum-or-underscore by char code (hot GFM gate).
+function isAlnumCode(c) {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+function isWordCode(c) {
+  return isAlnumCode(c) || c === 95;
 }
 
 // Left/right flanking of the delimiter run s[i..j) (CommonMark).
@@ -1538,15 +1576,27 @@ const WWW_RE = /www\.[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*/y;
 const EMAIL_RE = /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?)*/y;
 const URL_RE = /(?:https?|ftp):\/\/[^\s<]+/iy;
 
+// Email local-part characters: [A-Za-z0-9.!#$%&'*+/=?^_`{|}~-].
+function isEmailLocalCode(c) {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+    c === 46 || c === 33 || c === 35 || c === 36 || c === 37 || c === 38 || c === 39 ||
+    c === 42 || c === 43 || c === 45 || c === 47 || c === 61 || c === 63 || c === 94 ||
+    c === 95 || c === 96 || c === 123 || c === 124 || c === 125 || c === 126;
+}
+
 // Match a bare email address at s[i]. Returns {end} or null. The domain
 // must contain a dot, and the match is rejected if the next character
 // is '-' or '_' (the address may continue there).
 function matchEmail(s, i) {
-  // Only try when an '@' lies ahead within the same word.
+  // Only try when an '@' lies ahead within the same word. The scan is
+  // bounded to 64 chars and stops at the first character that cannot
+  // be part of an email local part (the EMAIL_RE below would stop
+  // there too, so this only bails out earlier).
   let at = -1;
   for (let k = i; k < s.length && k < i + 64; k++) {
-    if (s[k] === '@') { at = k; break; }
-    if (isUniSpace(s[k]) || s[k] === '<') break;
+    const c = s.charCodeAt(k);
+    if (c === 64) { at = k; break; } // '@'
+    if (!isEmailLocalCode(c)) break;
   }
   if (at < 0) return null;
   EMAIL_RE.lastIndex = i;
@@ -1579,7 +1629,7 @@ function matchGfmAutolink(s, i) {
   const prev = i > 0 ? s[i - 1] : '';
   // A '_' before the address is a boundary when it is an emphasis
   // delimiter (not preceded by an alphanumeric, i.e. not intraword).
-  if (prev !== '' && /[A-Za-z0-9_]/.test(prev) && !(prev === '_' && (i < 2 || !/[A-Za-z0-9]/.test(s[i - 2])))) return null;
+  if (prev !== '' && isWordCode(prev.charCodeAt(0)) && !(prev === '_' && (i < 2 || !isAlnumCode(s.charCodeAt(i - 2))))) return null;
   if (s.startsWith('www.', i)) {
     WWW_RE.lastIndex = i;
     const m = WWW_RE.exec(s);
@@ -1643,7 +1693,7 @@ function containsLink(items) {
 // masked source for a closer run of the same length, counting inner
 // opener runs (groups 3/4) so nested `~~` pairs close at the right
 // place. Returns {rawLen, inner} or null.
-function tryDel(s, t, i) {
+function tryDel(s, t, i, getCloser) {
   let j = i;
   while (j < s.length && s[j] === '~') j++;
   const o = j - i;
@@ -1658,7 +1708,7 @@ function tryDel(s, t, i) {
   const prev = i > 0 ? s[i - 1] : '';
   const prevPuSp = prev !== '' && (isUniSpace(prev) || isUniPunct(prev));
   if (d && prev !== '' && !prevPuSp) return null;
-  const v = lastPossibleCloser(t, '~');
+  const v = getCloser('~');
   if (v < j) return null;
   let p = o;
   let pos = j;
@@ -1700,7 +1750,12 @@ let inlineInLink = false;
 // ---------------------------------------------------------------------------
 
 const EM_ALNUM_RE = /[\p{L}\p{N}]/u;
-function isEmAlnum(ch) { return ch !== '' && EM_ALNUM_RE.test(ch); }
+function isEmAlnum(ch) {
+  if (ch === '') return false;
+  const c = ch.charCodeAt(0);
+  if (c < 128) return isAlnumCode(c);
+  return EM_ALNUM_RE.test(ch);
+}
 
 // GFM character classes for the emphasis scan (marked's `ye`/`it`/
 // `st`): `punct` excludes `~`, `notPunctSpace` includes `~`,
@@ -1750,7 +1805,7 @@ function linkInText(s, refs) {
 // link, the label is NOT masked wholesale: only the nested links
 // are masked (recursively), so `*`/`_` around them stay visible.
 function maskReflinks(s, refs) {
-  if (!refs || !s.includes('[')) return s;
+  if (!refs || refs.size === 0 || !s.includes('[')) return s;
   let out = '';
   let i = 0;
   while (i < s.length) {
@@ -1808,9 +1863,14 @@ function maskEmAnyPunct(s) {
 }
 
 function maskEmSource(s, refs) {
+  // Each mask only runs when its trigger characters are present, so a
+  // plain paragraph skips all three regex passes entirely.
   s = maskReflinks(s, refs);
-  s = maskEmAnyPunct(s);
-  return s.replace(EM_MASK_RE, (m) => '[' + 'a'.repeat(Math.max(0, m.length - 2)) + ']');
+  if (s.indexOf('`') >= 0 || s.indexOf('\\') >= 0) s = maskEmAnyPunct(s);
+  if (s.indexOf('[') >= 0 || s.indexOf('`') >= 0 || s.indexOf('<') >= 0) {
+    s = s.replace(EM_MASK_RE, (m) => '[' + 'a'.repeat(Math.max(0, m.length - 2)) + ']');
+  }
+  return s;
 }
 
 // Last possible closer index (marked's `fe`/`ze`): the start index of
@@ -1818,13 +1878,13 @@ function maskEmSource(s, refs) {
 // space, tab, newline, CR or FF; -1 when there is none.
 function lastPossibleCloser(s, r) {
   let v = -1;
-  for (let k = 0; k < s.length; k++) {
-    if (s[k] !== r) continue;
+  let k = s.indexOf(r);
+  while (k >= 0) {
     const before = k === 0 ? '\n' : s[k - 1];
     let j = k + 1;
     while (j < s.length && s[j] === r) j++;
     if (before !== ' ' && before !== '\t' && before !== '\n' && before !== '\r' && before !== '\f') v = k;
-    k = j - 1;
+    k = s.indexOf(r, j);
   }
   return v;
 }
@@ -1885,7 +1945,7 @@ function skipEmPattern(t, start, r) {
 // `t` is the masked source (code spans/links/HTML hidden); indices in
 // `t` match those in `s`, so the returned span is sliced from `s`.
 // Returns {tag, rawLen, inner} or null.
-function tryEmStrong(s, t, i) {
+function tryEmStrong(s, t, i, getCloser, getSkipPat) {
   const r = s[i];
   let j = i;
   while (j < s.length && s[j] === r) j++;
@@ -1915,13 +1975,16 @@ function tryEmStrong(s, t, i) {
   if (d && n !== '' && !u) return null;
   const y = (i - l) + k;
   const R = p !== '' && !isUniSpace(p) && (d || (r === '*' && !h));
-  const v = lastPossibleCloser(t, r);
+  const v = getCloser(r);
   const Q = i + k;
   if (v < Q) return null;
   let m = k, f = 0;
   // The `__...*...__` / `**..._...**` skip applies at the start of
-  // the scan only (the regex alternative is `^`-anchored).
-  let pos = skipEmPattern(t, Q, r);
+  // the scan only (the regex alternative is `^`-anchored). It can
+  // only match when the opposite double delimiter exists at all, so
+  // skip the scan entirely otherwise (indexOf would walk to the end
+  // of the paragraph on every attempt).
+  let pos = getSkipPat()[r] ? skipEmPattern(t, Q, r) : Q;
   for (;;) {
     const next = t.indexOf(r, pos);
     if (next < 0) return null;
@@ -1956,6 +2019,18 @@ function tryEmStrong(s, t, i) {
   }
 }
 
+// Maximal run of characters the inline loop treats as plain text.
+// Sticky: exec from a plain char consumes up to the next special char.
+const PLAIN_RE = /[^\\`\n*_~<\[!]+/y;
+// Substrings that can start a GFM extended autolink (www./scheme URL/
+// mailto:/xmpp:/email). A plain run containing none of these cannot
+// contain an autolink start, so it can be bulk-appended. The bare-URL
+// rule (URL_RE) is case-insensitive, so the scheme part is spelled out
+// with character classes (e.g. "Https://www.example.com" must trigger
+// the fallback even though the www. rule itself is lowercase-only);
+// the other alternatives stay case-sensitive, matching the lexer.
+const GFM_TRIGGER_RE = /www\.|mailto:|xmpp:|@|[Hh][Tt][Tt][Pp][Ss]?:|[Ff][Tt][Pp]:/;
+
 function parseInline(s, refs, noGfm) {
   const items = [];
   let text = '';
@@ -1964,10 +2039,79 @@ function parseInline(s, refs, noGfm) {
   // when the text contains an emphasis delimiter).
   let masked = null;
   const getMasked = () => (masked ??= maskEmSource(s, refs));
+  // lastPossibleCloser is O(n) per call and depends only on the
+  // masked source + delimiter char, so cache it per parseInline call
+  // instead of rescanning for every emphasis attempt.
+  const closerCache = { '*': -2, '_': -2, '~': -2 };
+  const getCloser = (r) => {
+    let v = closerCache[r];
+    if (v === -2) { v = lastPossibleCloser(getMasked(), r); closerCache[r] = v; }
+    return v;
+  };
+  // Whether the `__...*...__` / `**..._...**` skip pattern can occur
+  // at all in this text (computed once, lazily, from the mask).
+  let skipPat = null;
+  const getSkipPat = () => {
+    if (skipPat === null) {
+      const m = getMasked();
+      skipPat = { '*': m.indexOf('__') >= 0, '_': m.indexOf('**') >= 0 };
+    }
+    return skipPat;
+  };
   const n = s.length;
   let i = 0;
   while (i < n) {
     const c = s[i];
+    // Bulk plain-text run: when the current char is not special, grab
+    // the maximal plain run with one native regex scan and append it
+    // whole instead of one character per loop iteration. A run is only
+    // bulk-appended when it cannot contain a GFM autolink start (or
+    // when GFM autolinks are off here); otherwise append up to the
+    // start of the word holding the first trigger and let the
+    // per-character loop handle that word (its gate re-validates the
+    // boundary, so backing up over local-part characters is safe).
+    if (c !== '\\' && c !== '`' && c !== '\n' && c !== '*' && c !== '_' && c !== '~' && c !== '<' && c !== '[' && c !== '!') {
+      PLAIN_RE.lastIndex = i;
+      const m = PLAIN_RE.exec(s);
+      if (m && m[0].length > 1) {
+        const chunk = m[0];
+        const j = i + chunk.length;
+        if (noGfm || inlineInLink) {
+          text += chunk;
+          i = j;
+          continue;
+        }
+        const tm = GFM_TRIGGER_RE.exec(chunk);
+        // An email autolink can start in this chunk while its '@'
+        // lies past the chunk end: the local part may contain '_',
+        // '*', '~' or '!' (all chunk boundaries). When the chunk
+        // ends at one of those, scan the local-part run past the end
+        // for an '@' within 64 chars of a start inside the chunk.
+        let atAhead = false;
+        const endCh = s[j];
+        if (!tm && (endCh === '_' || endCh === '*' || endCh === '~' || endCh === '!')) {
+          for (let k = j; k < n && k < j + 64; k++) {
+            const cc = s.charCodeAt(k);
+            if (cc === 64) { atAhead = true; break; } // '@'
+            if (!isEmailLocalCode(cc)) break;
+          }
+        }
+        if (!tm && !atAhead) {
+          text += chunk;
+          i = j;
+          continue;
+        }
+        if (tm) {
+          let ws = tm.index;
+          while (ws > 0 && isEmailLocalCode(chunk.charCodeAt(ws - 1))) ws--;
+          if (ws > 0) {
+            text += chunk.slice(0, ws);
+            i += ws;
+            continue;
+          }
+        }
+      }
+    }
     if (c === '\\' && i + 1 < n) {
       const d = s[i + 1];
       if (d === '\n') {
@@ -2032,7 +2176,7 @@ function parseInline(s, refs, noGfm) {
         // — that is why the flat delimiter model left `**` literal
         // inside `<del>` (doc-06, doc-19). On no match, fall through
         // to the flat delimiter handling below.
-        const dm = tryDel(s, getMasked(), i);
+        const dm = tryDel(s, getMasked(), i, getCloser);
         if (dm) {
           flush();
           items.push({ t: 'del', children: parseInline(dm.inner, refs, noGfm) });
@@ -2046,7 +2190,7 @@ function parseInline(s, refs, noGfm) {
         // recursively (so nested emphasis/links resolve inside it).
         // On failure, one character is literal text and the scan is
         // retried at the next character (the run, now one shorter).
-        const em = tryEmStrong(s, getMasked(), i);
+        const em = tryEmStrong(s, getMasked(), i, getCloser, getSkipPat);
         if (em) {
           flush();
           const kids = parseInline(em.inner, refs, noGfm);
@@ -2148,7 +2292,7 @@ function parseInline(s, refs, noGfm) {
     // A '_' before the address is a boundary too when it is an
     // emphasis delimiter (not preceded by an alphanumeric, i.e. not
     // intraword).
-    if (!noGfm && !inlineInLink && /[A-Za-z0-9]/.test(c) && (i === 0 || !/[A-Za-z0-9_]/.test(s[i - 1]) || (s[i - 1] === '_' && (i < 2 || !/[A-Za-z0-9]/.test(s[i - 2]))))) {
+    if (!noGfm && !inlineInLink && isAlnumCode(c.charCodeAt(0)) && (i === 0 || !isWordCode(s.charCodeAt(i - 1)) || (s[i - 1] === '_' && (i < 2 || !isAlnumCode(s.charCodeAt(i - 2)))))) {
       const g = matchGfmAutolink(s, i);
       if (g) {
         const href = cleanUrl(g.href);
