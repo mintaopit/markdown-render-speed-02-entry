@@ -12,11 +12,11 @@ function renderBlock(b, refs, out) {
     case 'empty':
       return;
     case 'para': {
-      out.push('<p>' + renderInline(parseInline(b.lines.join('\n'), refs)) + '</p>\n');
+      out.push('<p>', renderInline(parseInline(b.lines.join('\n'), refs)), '</p>\n');
       return;
     }
     case 'heading': {
-      out.push('<h' + b.level + '>' + renderInline(parseInline(b.text, refs)) + '</h' + b.level + '>\n');
+      out.push('<h' + b.level + '>', renderInline(parseInline(b.text, refs)), '</h' + b.level + '>\n');
       return;
     }
     case 'code': {
@@ -215,8 +215,12 @@ function escText(s) {
   });
 }
 
+// Chars encodeURI leaves alone (plus '%', handled separately below).
+const CLEAN_URL_RE = /[^A-Za-z0-9;,/?:@&=+$\-_.!~*'()#%]/;
 // marked's URL cleaning: encodeURI, keeping %XX sequences intact.
 function cleanUrl(href) {
+  // Fast path: no '%' and nothing encodeURI would escape.
+  if (href.indexOf('%') < 0 && !CLEAN_URL_RE.test(href)) return href;
   try {
     const u = encodeURI(href);
     return u.indexOf('%25') < 0 ? u : u.replace(/%25/g, '%');
@@ -1301,7 +1305,9 @@ export function parseBlocks(src) {
           if (after.every(s => s === '')) child.text = child.text.slice(0, -1);
         }
       }
-      fixLastItemHtml(child);
+      // Only containers can hold the target (an html block inside a
+      // list item); leaves (para/heading/code/table/...) never do.
+      if (child.t === 'doc' || child.t === 'list' || child.t === 'item' || child.t === 'quote') fixLastItemHtml(child);
     }
   }
 
@@ -1851,7 +1857,14 @@ function maskReflinks(s, refs) {
 // pattern match a spurious span across two real code spans, hiding
 // the emphasis delimiters between them.
 const EM_ANY_PUNCT_RE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+// Escaped punctuation only (no code spans): a much cheaper pattern
+// than EM_ANY_PUNCT_RE, which carries a lazy [\s\S]*? alternative.
+const EM_ESC_PUNCT_RE = /\\[\p{P}\p{S}]/gu;
 function maskEmAnyPunct(s) {
+  // Without a multi-backtick delimiter there can be no code span
+  // whose content holds a backtick, so only escaped punctuation
+  // needs masking (the cheap pattern above).
+  if (s.indexOf('``') < 0) return s.replace(EM_ESC_PUNCT_RE, (m) => '+'.repeat(m.length));
   return s.replace(EM_ANY_PUNCT_RE, (m, ticks, escPunct) => {
     if (escPunct !== undefined) return '+'.repeat(m.length);
     if (ticks !== undefined) {
@@ -1865,8 +1878,12 @@ function maskEmAnyPunct(s) {
 function maskEmSource(s, refs) {
   // Each mask only runs when its trigger characters are present, so a
   // plain paragraph skips all three regex passes entirely.
+  // maskEmAnyPunct only changes anything for a code span whose content
+  // holds a backtick (needs a multi-backtick delimiter) or an escaped
+  // punctuation mark (needs a backslash); a single backtick or a lone
+  // backslash-free run is an identity for it.
   s = maskReflinks(s, refs);
-  if (s.indexOf('`') >= 0 || s.indexOf('\\') >= 0) s = maskEmAnyPunct(s);
+  if (s.indexOf('``') >= 0 || s.indexOf('\\') >= 0) s = maskEmAnyPunct(s);
   if (s.indexOf('[') >= 0 || s.indexOf('`') >= 0 || s.indexOf('<') >= 0) {
     s = s.replace(EM_MASK_RE, (m) => '[' + 'a'.repeat(Math.max(0, m.length - 2)) + ']');
   }
@@ -2433,14 +2450,21 @@ function tableDelimiter(line) {
 // it, then the row is split on " |"; a leading/trailing empty cell is
 // dropped, and each cell is trimmed with `\|` unescaped to `|`.
 function splitCells(row) {
-  const t = row.replace(/\|/g, (r, o, s) => {
-    let escaped = false, p = o;
-    while (--p >= 0 && s[p] === '\\') escaped = !escaped;
-    return escaped ? '|' : ' |';
-  });
+  // Fast path: with no backslash, no pipe is escaped.
+  let t;
+  if (row.indexOf('\\') < 0) {
+    t = row.replace(/\|/g, ' |');
+  } else {
+    t = row.replace(/\|/g, (r, o, s) => {
+      let escaped = false, p = o;
+      while (--p >= 0 && s[p] === '\\') escaped = !escaped;
+      return escaped ? '|' : ' |';
+    });
+  }
   const cells = t.split(/ \|/);
   if (cells.length && !cells[0].trim()) cells.shift();
   if (cells.length && !cells[cells.length - 1].trim()) cells.pop();
+  if (row.indexOf('\\') < 0) return cells.map((c) => c.trim());
   return cells.map((c) => c.trim().replace(/\\\|/g, '|'));
 }
 
