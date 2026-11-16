@@ -274,6 +274,19 @@ function expandLeadingTabs(s, col) {
   return out + s.slice(i);
 }
 
+// Marked's Dt: dedent one fenced-code content line by the opening
+// fence's leading-whitespace CHARACTER count (backtick fences only).
+// A leading tab counts as ONE character, so a tab-indented line is
+// stripped whole; a line with no leading whitespace is untouched.
+// (Column-based stripIndent is wrong here: it expands a tab to 4
+// columns and leaves a residue when the fence indent is < 4.)
+function fenceDedentLine(line, n) {
+  if (!n) return line;
+  const m = /^\s+/.exec(line);
+  if (!m) return line;
+  return line.slice(Math.min(m[0].length, n));
+}
+
 // The column used for tab expansion inside a code block: marked
 // re-parses each quote level's content, so containers OUTSIDE the
 // innermost quote contribute nothing to the tab column; containers
@@ -636,7 +649,7 @@ function matchFence(s, base) {
   const fence = m[1];
   const info = m[2];
   if (fence[0] === '`' && info.indexOf('`') >= 0) return null;
-  return { char: fence[0], len: fence.length, info: info.trim(), indent: ind.col - base };
+  return { char: fence[0], len: fence.length, info: info.trim(), indent: ind.col - base, indentChars: ind.i };
 }
 
 // Thematic break: three or more of -, _ or * (one kind), spaces allowed.
@@ -906,7 +919,7 @@ export function parseBlocks(src) {
   function handleBlank(s, base, rawBlank) {
     if (tip.t === 'para') { const p = tip; tip = tip.parent; finalize(p); }
     if (tip.t === 'code') {
-      tip.lines.push(stripIndent(s, tip.fenced ? tip.fenceIndent : 4, base || 0));
+      tip.lines.push(tip.fenced ? fenceDedentLine(s, tip.fenceDedent) : stripIndent(s, 4, base || 0));
       tip.prevBodyLine = '';
       tip.prevBodyBlank = true;
       return;
@@ -1059,7 +1072,7 @@ export function parseBlocks(src) {
           }
         }
         const bodyLine = col > 0 ? expandLeadingTabs(cur, tabCol(tip, col)) : cur;
-        tip.lines.push(stripIndent(bodyLine, tip.fenceIndent, col));
+        tip.lines.push(fenceDedentLine(bodyLine, tip.fenceDedent));
         tip.prevBodyLine = bodyLine;
         tip.prevBodyBlank = false;
         break;
@@ -1131,7 +1144,7 @@ export function parseBlocks(src) {
           // marked's indent compensation (Dt) only applies to backtick
           // fences: its regex is /^(\s+)(?:```)/, so a tilde fence's
           // content is never dedented by the fence indent.
-          c.fenceIndent = fence.char === '~' ? 0 : fence.indent; c.info = fence.info; c.lines = [];
+          c.fenceDedent = fence.char === '`' ? fence.indentChars : 0; c.info = fence.info; c.lines = [];
           addChild(container, c);
           // Track the fence-open line (in the item's body coordinates)
           // so a later under-indented line can be judged by marked's
@@ -1197,7 +1210,7 @@ export function parseBlocks(src) {
         // marked's indent compensation (Dt) only applies to backtick
         // fences: its regex is /^(\s+)(?:```)/, so a tilde fence's
         // content is never dedented by the fence indent.
-        c.fenceIndent = fence.char === '~' ? 0 : fence.indent; c.info = fence.info; c.lines = [];
+        c.fenceDedent = fence.char === '`' ? fence.indentChars : 0; c.info = fence.info; c.lines = [];
         addChild(container, c);
         // Track the fence-open line (in the item's body coordinates)
         // so a later under-indented line can be judged by marked's
