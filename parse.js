@@ -766,6 +766,91 @@ export function parseBlocks(src) {
     return block;
   }
 
+  // Lines after the block, stripped of container prefixes (outermost
+  // first). Stops at the first line that does not belong to the
+  // containers. Used to decide an HTML block's trailing newline.
+  function htmlAfterLines(block) {
+    const ll = block.lastLine === undefined ? lines.length - 1 : block.lastLine;
+    const chain = [];
+    for (let n = block.parent; n; n = n.parent)
+      if (n.t === 'quote' || n.t === 'item') chain.unshift(n);
+    const after = [];
+    outer:
+    for (let j = ll + 1; j < lines.length; j++) {
+      let s = lines[j], c = 0;
+      for (let a = 0; a < chain.length; a++) {
+        const anc = chain[a];
+        if (anc.t === 'quote') {
+          const r = matchQuote(s, c);
+          if (!r) break outer;
+          s = r.s; c = r.col;
+        } else if (anc.t === 'item') {
+          if (isBlankLine(s)) { s = stripIndent(s, anc.contentIndent, c); break; }
+          const ind = indentCols(s, c);
+          if (ind.col - c < anc.contentIndent) break outer;
+          s = stripIndent(s, anc.contentIndent, c);
+          c += anc.contentIndent;
+        }
+      }
+      after.push(s);
+    }
+    return { after, chain };
+  }
+
+  // Lines after the block that belong to the given item ancestor, in
+  // the item's coordinates. Inner containers below the item are not
+  // stripped: a line that left such a container can still belong to
+  // the item. Mirrors marked's list tokenizer, whose item text is
+  // trimEnd-ed when the item is the last of its list.
+  function itemAfterLines(block, item) {
+    const ll = block.lastLine === undefined ? lines.length - 1 : block.lastLine;
+    const chain = [];
+    for (let n = block.parent; n; n = n.parent) {
+      if (n.t === 'quote' || n.t === 'item') chain.unshift(n);
+      if (n === item) break;
+    }
+    const after = [];
+    outer:
+    for (let j = ll + 1; j < lines.length; j++) {
+      let s = lines[j], c = 0;
+      for (let a = 0; a < chain.length; a++) {
+        const anc = chain[a];
+        if (anc.t === 'quote') {
+          const r = matchQuote(s, c);
+          if (!r) break outer;
+          s = r.s; c = r.col;
+        } else if (anc.t === 'item') {
+          if (isBlankLine(s)) { s = stripIndent(s, anc.contentIndent, c); break; }
+          const ind = indentCols(s, c);
+          if (ind.col - c < anc.contentIndent) break outer;
+          s = stripIndent(s, anc.contentIndent, c);
+          c += anc.contentIndent;
+        }
+      }
+      after.push(s);
+    }
+    return after;
+  }
+
+  // Whether an HTML block (type 1-5) keeps a trailing '\n' in its text.
+  // Mirrors marked: its html regex consumes the newline(s) after the
+  // end-tag line inside the block's container coordinates, and `ge`
+  // drops them only when two or more follow (a blank line follows).
+  // In container coordinates the source is the stripped lines joined by
+  // '\n' (never ending in '\n'); at top level the raw source may end
+  // in '\n'. So: kept when the next line in container coordinates has
+  // content, or (inside a container) when exactly one blank line is
+  // all that remains; at top level with no next line, kept iff the
+  // source ends in '\n'.
+  function htmlTrailingNl(block) {
+    const { after, chain } = htmlAfterLines(block);
+    if (after.length === 0) return chain.length === 0 && srcEndsNl;
+    let e = 0;
+    while (e < after.length && after[e] === '') e++;
+    if (chain.length === 0) return e === 0;
+    return e === 0 || (e === after.length && e === 1);
+  }
+
   function finalize(block) {
     block.open = false;
     if (block.t === 'para') {
@@ -795,10 +880,10 @@ export function parseBlocks(src) {
       if (block.text.length) {
         const ll = block.lastLine === undefined ? lines.length - 1 : block.lastLine;
         if (block.htmlType <= 5) {
-          // Only a truly empty next line suppresses the trailing
-          // newline; a whitespace-only line (tab/spaces) keeps it.
-          const nextBlank = ll + 1 < lines.length && lines[ll + 1].length === 0;
-          if (!nextBlank && (ll < lines.length - 1 || srcEndsNl)) block.text += '\n';
+          // Only the newline count in the block's container
+          // coordinates decides (see htmlTrailingNl): one '\n' after
+          // the end-tag line keeps it, a blank next line drops it.
+          if (htmlTrailingNl(block)) block.text += '\n';
         } else if (ll >= lines.length - 1 && srcEndsNl) {
           block.text += '\n';
         }
@@ -1164,7 +1249,29 @@ export function parseBlocks(src) {
     }
   }
 
+  // Marked trimEnd-s the text of the last item of every list before
+  // tokenizing it, so an HTML block (type 1-5) that is the last
+  // non-blank content of a last item loses its trailing newline even
+  // when a single blank line follows it in container coordinates.
+  // Runs after the whole document is parsed, when lists are complete.
+  function fixLastItemHtml(block) {
+    for (const child of block.children || []) {
+      if (child.t === 'html' && child.htmlType <= 5 && child.text.endsWith('\n')) {
+        let item = child.parent;
+        while (item && item.t !== 'item') item = item.parent;
+        const list = item && item.parent;
+        if (item && list && list.t === 'list' &&
+            list.children[list.children.length - 1] === item) {
+          const after = itemAfterLines(child, item);
+          if (after.every(s => s === '')) child.text = child.text.slice(0, -1);
+        }
+      }
+      fixLastItemHtml(child);
+    }
+  }
+
   closeTo(doc);
+  fixLastItemHtml(doc);
   return doc;
 
   function startList(container, lm) {
