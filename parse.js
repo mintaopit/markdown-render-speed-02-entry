@@ -1259,18 +1259,33 @@ function findLabelEnd(s, i) {
       let j = k;
       while (j < s.length && s[j] === '`') j++;
       const run = j - k;
+      // marked's inline-label regex: a backtick run opens a
+      // code-span-like unit `+ [^`]*? `+ whose closing run may be
+      // ANY length (not necessarily the opener's), so e.g. `` ``url` ``
+      // in a label is consumed as one unit and the label still ends
+      // at the first `]` (doc-09, doc-28). If there is no closing
+      // backtick at all, the label cannot proceed past the run —
+      // except a run of 2+ immediately before `]` (``+(?=])).
+      // The old equal-length scan jumped past the label's `]` to a
+      // matching run far later in the paragraph.
+      // Backtracking order: marked's lazy label regex settles on the
+      // SHORTEST label that forms a link, so when a run of 2+ sits
+      // right before `]` (``+(?=])), consume just the run and end
+      // the label there (doc-33) instead of spanning to a later
+      // backtick; the long span is only taken when it is the only
+      // way the label can close.
+      if (run >= 2 && s[j] === ']') { k = j; continue; }
       let m = j, found = -1;
       while (m < s.length) {
         if (s[m] === '`') {
           let e = m;
           while (e < s.length && s[e] === '`') e++;
-          if (e - m === run) { found = e; break; }
-          m = e;
-        } else m++;
+          found = e;
+          break;
+        }
+        m++;
       }
-      // No matching closer: the run is literal text (cm-347 rule) —
-      // skip just the run and keep scanning for the label end.
-      if (found < 0) { k = j; continue; }
+      if (found < 0) return -1;
       k = found;
       continue;
     }
@@ -1375,39 +1390,23 @@ function matchInlineHtml(s, i) {
 
 // Trim trailing punctuation from a GFM autolink candidate (.,;:!?*_~ and
 // unbalanced closing brackets). Returns the trimmed end index.
+// marked's _backpedal, applied until stable: trims a bare-URL/www.
+// autolink to the longest prefix its URL rule accepts. Trailing
+// punctuation is dropped, a `(` without a matching `)` later
+// truncates the URL at the `(`, a trailing `&name;` entity is
+// dropped, and a trailing `]` is kept (it is not in the punctuation
+// set). This replaces the hand-rolled trimmer, which missed the
+// unmatched-`(` truncation (doc-08).
+const BACKPEDAL_RE = /(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/y;
 function trimAutolinkEnd(s, start, end) {
-  let e = end;
-  // Repeat until stable: trimming a closer can expose punctuation,
-  // and trimming punctuation can expose another unbalanced closer.
+  let cur = s.slice(start, end);
   for (;;) {
-    const before = e;
-    // Trailing punctuation (note: ';' is not in this set — it is handled
-    // by the entity rule below).
-    while (e > start && '.,:!?*_~'.indexOf(s[e - 1]) >= 0) e--;
-    // A trailing ')' is kept only when it closes a '(' group with no
-    // other ')' inside — the last '(' before it must have no ')'
-    // between it and the trailing ')'. (Marked's _backpedal matches
-    // such a group as a unit; a plain count of opens vs closes is
-    // wrong, because a ')' before the '(' does not close it.) A
-    // trailing ']' is always part of the URL: the backpedal's
-    // non-punctuation run includes ']'.
-    while (e > start && s[e - 1] === ')') {
-      let k = e - 2;
-      while (k >= start && s[k] !== '(' && s[k] !== ')') k--;
-      if (k >= start && s[k] === '(') break; // matched group: keep it
-      e--;
-    }
-    // A trailing entity-like `&name;` is not part of the link; a bare
-    // trailing ';' is trailing punctuation and is trimmed too.
-    if (e > start && s[e - 1] === ';') {
-      let a = e - 2;
-      while (a >= start && /[A-Za-z0-9]/.test(s[a])) a--;
-      if (a >= start && s[a] === '&' && a + 1 < e - 1) e = a;
-      else e--;
-    }
-    if (e === before) break;
+    BACKPEDAL_RE.lastIndex = 0;
+    const m = BACKPEDAL_RE.exec(cur);
+    const next = m ? m[0] : '';
+    if (next === cur) return start + cur.length;
+    cur = next;
   }
-  return e;
 }
 
 // Try to match a GFM extended autolink (www., email, or bare scheme URL)
