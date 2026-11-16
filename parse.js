@@ -139,6 +139,7 @@ export function parse(src) {
   const doc = parseBlocks(src);
   const refs = doc.refs || new Map();
   const out = [];
+  inlineInLink = false;
   renderBlocks(doc, refs, out);
   return out.join('');
 }
@@ -553,12 +554,14 @@ function matchQuote(s, col) {
   if (s[ind.i] !== '>') return null;
   let rest = s.slice(ind.i + 1);
   let ncol = col + (ind.col - col) + 1;
+  // Expand the whitespace after the marker (marked expands tabs here
+  // via J, using the marker length as the column base — not the
+  // absolute column, so a tab inside a list item expands from the
+  // item's body, not from column 0), then strip the single optional
+  // space. A tab after the space must be expanded too: `> \tfoo`
+  // becomes `>  foo`, not a literal tab in the paragraph text.
+  rest = expandLeadingTabs(rest, (ind.col - col) + 1);
   if (rest.startsWith(' ')) { rest = rest.slice(1); ncol++; }
-  else if (rest.startsWith('\t')) {
-    const w = 4 - (ncol % 4);
-    rest = ' '.repeat(w - 1) + rest.slice(1);
-    ncol++;
-  }
   return { s: rest, col: ncol };
 }
 
@@ -673,6 +676,42 @@ function startsInterruptBlock(s, base) {
   return false;
 }
 
+// Marked's list-item body rule, used when a line inside a fenced code
+// block falls below the item's content indent. `n` is the indent bound
+// for a line that starts a new block: clamp(contentIndent - 1, 0, 3).
+// lineBeginsBlock tests the CURRENT line (a fence, ATX heading, HTML
+// block, block quote, list marker, or thematic break within n columns
+// ends the item outright). prevLineBeginsBlock tests the PREVIOUS body
+// line for the same, minus quote/marker: when it begins a fence, ATX
+// heading, HTML block, or thematic break, a following under-indented
+// line also ends the item. An HTML block of type 7 (a complete tag on
+// its own line) does not count in either case.
+function lineBeginsBlock(s, base, n) {
+  const ind = indentCols(s, base);
+  if (ind.col - (base || 0) > n) return false;
+  const t = s.slice(ind.i);
+  if (t.startsWith('```') || t.startsWith('~~~')) return true;
+  if (/^#{1,6}(?:[ \t]|$)/.test(t)) return true;
+  if (t.startsWith('>')) return true;
+  const hb = htmlBlockStart(t, 0);
+  if (hb && hb.type !== 7) return true;
+  if (matchListMarker(t, 0)) return true;
+  if (matchHr(t, 0)) return true;
+  return false;
+}
+
+function prevLineBeginsBlock(m, n) {
+  const ind = indentCols(m, 0);
+  if (ind.col > n) return false;
+  const t = m.slice(ind.i);
+  if (t.startsWith('```') || t.startsWith('~~~')) return true;
+  if (/^#{1,6}(?:[ \t]|$)/.test(t)) return true;
+  const hb = htmlBlockStart(t, 0);
+  if (hb && hb.type !== 7) return true;
+  if (matchHr(t, 0)) return true;
+  return false;
+}
+
 function newBlock(type) {
   return {
     t: type, children: [], open: true, lastLineBlank: false, parent: null,
@@ -783,6 +822,8 @@ export function parseBlocks(src) {
     if (tip.t === 'para') { const p = tip; tip = tip.parent; finalize(p); }
     if (tip.t === 'code') {
       tip.lines.push(stripIndent(s, tip.fenced ? tip.fenceIndent : 4, base || 0));
+      tip.prevBodyLine = '';
+      tip.prevBodyBlank = true;
       return;
     }
     if (tip.t === 'html') {
@@ -842,13 +883,27 @@ export function parseBlocks(src) {
             cur = stripIndent(cur, last.contentIndent, col);
             col += last.contentIndent;
             node = last;
-          } else if (tip.t === 'code' && tip.fenced) {
-            // A fenced code block's content need not be indented to the
-            // item's content indent: the line is still code content.
-            node = last;
           } else if (tip.t === 'para' && !startsInterruptBlock(cur, col) && !matchListMarker(cur, col)) {
             // A lazy line indented >= 4 columns loses 4 of them.
             if (ind.col - col >= 4) { cur = stripIndent(cur, 4, col); col += 4; }
+            lazy = true; node = last;
+          } else if (tip.t === 'code' && tip.fenced && tip.parent === last) {
+            // A line below the item's content indent inside a fenced
+            // code block: marked's list-item body rule keeps it as code
+            // content unless the previous body line was blank, was
+            // indented >= 4 columns, or began a fence/heading/HTML
+            // block/thematic break — or the line itself begins a block
+            // (fence, heading, HTML, quote, list marker, hr). The
+            // fence-open line counts as "began a fence", so the first
+            // under-indented content line still ends the item and the
+            // block stays empty.
+            const n = Math.max(0, Math.min(3, last.contentIndent - 1));
+            if (lineBeginsBlock(cur, col, n)) { allMatched = false; break; }
+            const m = tip.prevBodyLine || '';
+            const mInd = m.replace(/\t/g, '    ').search(/\S/);
+            if (tip.prevBodyBlank || mInd >= 4 || prevLineBeginsBlock(m, n)) {
+              allMatched = false; break;
+            }
             lazy = true; node = last;
           } else { allMatched = false; break; }
         }
@@ -918,7 +973,10 @@ export function parseBlocks(src) {
             break;
           }
         }
-        tip.lines.push(stripIndent(col > 0 ? expandLeadingTabs(cur, tabCol(tip, col)) : cur, tip.fenceIndent, col));
+        const bodyLine = col > 0 ? expandLeadingTabs(cur, tabCol(tip, col)) : cur;
+        tip.lines.push(stripIndent(bodyLine, tip.fenceIndent, col));
+        tip.prevBodyLine = bodyLine;
+        tip.prevBodyBlank = false;
         break;
       }
       if (tip.t === 'code' && !tip.fenced) {
@@ -948,7 +1006,10 @@ export function parseBlocks(src) {
           tip.lastLineBlank = false;
           break;
         }
-        if (st) {
+        // A setext underline is a table row, not a heading, when the
+        // paragraph so far is a table (header + delimiter): marked
+        // tries the table rule before the setext rule.
+        if (st && !isTableHeader(tip.lines)) {
           // Strip leading link definitions first: they are not part of
           // the paragraph, so they must not become heading text.
           const rest = stripDefs(tip);
@@ -982,8 +1043,16 @@ export function parseBlocks(src) {
           const p = tip; tip = tip.parent; finalize(p);
           const c = newBlock('code');
           c.fenced = true; c.fenceChar = fence.char; c.fenceLen = fence.len;
-          c.fenceIndent = fence.indent; c.info = fence.info; c.lines = [];
+          // marked's indent compensation (Dt) only applies to backtick
+          // fences: its regex is /^(\s+)(?:```)/, so a tilde fence's
+          // content is never dedented by the fence indent.
+          c.fenceIndent = fence.char === '~' ? 0 : fence.indent; c.info = fence.info; c.lines = [];
           addChild(container, c);
+          // Track the fence-open line (in the item's body coordinates)
+          // so a later under-indented line can be judged by marked's
+          // list-item body rule.
+          c.prevBodyLine = col > 0 ? expandLeadingTabs(cur, tabCol(c, col)) : cur;
+          c.prevBodyBlank = false;
           break;
         }
         if (matchHr(cur, col)) {
@@ -1040,8 +1109,16 @@ export function parseBlocks(src) {
       if (fence) {
         const c = newBlock('code');
         c.fenced = true; c.fenceChar = fence.char; c.fenceLen = fence.len;
-        c.fenceIndent = fence.indent; c.info = fence.info; c.lines = [];
+        // marked's indent compensation (Dt) only applies to backtick
+        // fences: its regex is /^(\s+)(?:```)/, so a tilde fence's
+        // content is never dedented by the fence indent.
+        c.fenceIndent = fence.char === '~' ? 0 : fence.indent; c.info = fence.info; c.lines = [];
         addChild(container, c);
+        // Track the fence-open line (in the item's body coordinates)
+        // so a later under-indented line can be judged by marked's
+        // list-item body rule.
+        c.prevBodyLine = col > 0 ? expandLeadingTabs(cur, tabCol(c, col)) : cur;
+        c.prevBodyBlank = false;
         break;
       }
       const hb = htmlBlockStart(cur, col);
@@ -1307,15 +1384,17 @@ function trimAutolinkEnd(s, start, end) {
     // Trailing punctuation (note: ';' is not in this set — it is handled
     // by the entity rule below).
     while (e > start && '.,:!?*_~'.indexOf(s[e - 1]) >= 0) e--;
-    while (e > start && (s[e - 1] === ')' || s[e - 1] === ']')) {
-      const open = s[e - 1] === ')' ? '(' : '[';
-      const close = s[e - 1];
-      let opens = 0, closes = 0;
-      for (let k = start; k < e - 1; k++) {
-        if (s[k] === open) opens++;
-        else if (s[k] === close) closes++;
-      }
-      if (opens > closes) break; // this closer is matched: keep it
+    // A trailing ')' is kept only when it closes a '(' group with no
+    // other ')' inside — the last '(' before it must have no ')'
+    // between it and the trailing ')'. (Marked's _backpedal matches
+    // such a group as a unit; a plain count of opens vs closes is
+    // wrong, because a ')' before the '(' does not close it.) A
+    // trailing ']' is always part of the URL: the backpedal's
+    // non-punctuation run includes ']'.
+    while (e > start && s[e - 1] === ')') {
+      let k = e - 2;
+      while (k >= start && s[k] !== '(' && s[k] !== ')') k--;
+      if (k >= start && s[k] === '(') break; // matched group: keep it
       e--;
     }
     // A trailing entity-like `&name;` is not part of the link; a bare
@@ -1440,10 +1519,289 @@ function containsLink(items) {
 }
 
 // Scan inline content into a flat item list, then resolve emphasis.
+// Persistent "inside a link" state for GFM autolinks, mirroring
+// marked: an opening `<a ...>` tag (inline) sets it, a closing `</a>`
+// clears it, and it is NOT reset between blocks — an unclosed `<a>`
+// suppresses bare-URL/email autolinks for the rest of the document.
+// Reset at the start of each parse().
+let inlineInLink = false;
+
+// ---------------------------------------------------------------------------
+// marked's emStrong scan (opener-driven), reimplemented from its
+// documented behaviour. For a `*`/`_` run at s[i], scan forward for a
+// closer run; when one is found, return {tag, rawLen, inner} where
+// inner is the text between the delimiters (minus 1 char per side for
+// em, 2 for strong). Returns null when no pair forms (the run is
+// literal text). This replaces the CommonMark closer-driven pairing
+// for `*`/`_`: marked departs from CommonMark here, and the kit's
+// RULES.txt says marked's HTML is the expected one.
+// ---------------------------------------------------------------------------
+
+const EM_ALNUM_RE = /[\p{L}\p{N}]/u;
+function isEmAlnum(ch) { return ch !== '' && EM_ALNUM_RE.test(ch); }
+
+// GFM character classes for the emphasis scan (marked's `ye`/`it`/
+// `st`): `punct` excludes `~`, `notPunctSpace` includes `~`,
+// `punctSpace` excludes `~`.
+function isEmPunct(ch) { return ch !== '' && ch !== '~' && isUniPunct(ch); }
+function isEmNps(ch) { return ch === '~' || (ch !== '' && !isUniSpace(ch) && !isUniPunct(ch)); }
+function isEmPunctSpace(ch) { return ch !== '' && ch !== '~' && (isUniSpace(ch) || isUniPunct(ch)); }
+
+// The masked source marked uses for its emphasis scan (its blockSkip
+// mask): code spans, inline links and HTML tags are replaced by
+// `[a...]` runs of the same length, so a `*`/`_` inside them can
+// never be an emphasis delimiter. The mask preserves length, so
+// indices in the masked text match the raw text.
+const EM_MASK_RE = /\[(?:[^\[\]`]|(`+)[^`]+\1(?!`))*?\]\((?:\\[\s\S]|[^\n(){}]|\((?:\\[\s\S]|[^\n()])*\))*\)|(?<!`)(`+)[^`]+\2(?!`)|<(?! )[^<>]*?>/g;
+// Does `s` contain an inline or reference link? (marked's
+// linkInText, simplified: a `[...](...)`, or a `[...][ref]` / `[...]`
+// whose reference is defined in `refs`.)
+function linkInText(s, refs) {
+  if (!s.includes('[')) return false;
+  let i = 0;
+  while (i < s.length) {
+    const lb = s.indexOf('[', i);
+    if (lb < 0) return false;
+    const le = findLabelEnd(s, lb);
+    if (le < 0) { i = lb + 1; continue; }
+    const labelText = s.slice(lb + 1, le - 1);
+    if (s[le] === '(') return true;
+    if (s[le] === '[') {
+      const le2 = findLabelEnd(s, le);
+      if (le2 >= 0) {
+        const refText = s.slice(le + 1, le2 - 1);
+        const key = normalizeLabel(refText.length ? refText : labelText);
+        if (refs && refs.has(key)) return true;
+      }
+    } else if (refs && refs.has(normalizeLabel(labelText))) {
+      return true;
+    }
+    i = le;
+  }
+  return false;
+}
+
+// Mask reference-link labels whose reference is defined, so a
+// `*`/`_` inside a label can't be an emphasis delimiter (marked's
+// reflinkSearch mask). Label and ref contents become `a`s, keeping
+// the brackets and the length. When the label itself contains a
+// link, the label is NOT masked wholesale: only the nested links
+// are masked (recursively), so `*`/`_` around them stay visible.
+function maskReflinks(s, refs) {
+  if (!refs || !s.includes('[')) return s;
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    const lb = s.indexOf('[', i);
+    if (lb < 0) { out += s.slice(i); break; }
+    out += s.slice(i, lb);
+    const le = findLabelEnd(s, lb);
+    if (le < 0) { out += '['; i = lb + 1; continue; }
+    const labelText = s.slice(lb + 1, le - 1);
+    let end = le, refInner = null, key = null;
+    if (s[le] === '[') {
+      const le2 = findLabelEnd(s, le);
+      if (le2 >= 0) {
+        const refText = s.slice(le + 1, le2 - 1);
+        key = normalizeLabel(refText.length ? refText : labelText);
+        refInner = refText;
+        end = le2;
+      }
+    } else {
+      key = normalizeLabel(labelText);
+    }
+    if (key !== null && refs.has(key)) {
+      if (linkInText(labelText, refs)) {
+        out += '[' + maskReflinks(labelText, refs) + ']';
+      } else {
+        out += '[' + 'a'.repeat(labelText.length) + ']';
+      }
+      if (refInner !== null) out += '[' + 'a'.repeat(refInner.length) + ']';
+      i = end;
+    } else {
+      out += s.slice(lb, le);
+      i = le;
+    }
+  }
+  return out;
+}
+
+// marked's anyPunctuationOutsideCode mask: escaped punctuation
+// becomes `+` (same length), and backticks inside a code span's
+// content become `+` while the span's delimiters are kept. This must
+// run before the blockSkip mask, or a code span whose content holds
+// a backtick (e.g. `` `` a ` b `` ``) would make the blockSkip code
+// pattern match a spurious span across two real code spans, hiding
+// the emphasis delimiters between them.
+const EM_ANY_PUNCT_RE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+function maskEmAnyPunct(s) {
+  return s.replace(EM_ANY_PUNCT_RE, (m, ticks, escPunct) => {
+    if (escPunct !== undefined) return '+'.repeat(m.length);
+    if (ticks !== undefined) {
+      return m.slice(0, ticks.length) +
+        m.slice(ticks.length, -ticks.length).replace(/`/g, '+') + ticks;
+    }
+    return m;
+  });
+}
+
+function maskEmSource(s, refs) {
+  s = maskReflinks(s, refs);
+  s = maskEmAnyPunct(s);
+  return s.replace(EM_MASK_RE, (m) => '[' + 'a'.repeat(Math.max(0, m.length - 2)) + ']');
+}
+
+// Last possible closer index (marked's `fe`/`ze`): the start index of
+// the last run of `r` that is not at position 0 and not preceded by a
+// space, tab, newline, CR or FF; -1 when there is none.
+function lastPossibleCloser(s, r) {
+  let v = -1;
+  for (let k = 0; k < s.length; k++) {
+    if (s[k] !== r) continue;
+    const before = k === 0 ? '\n' : s[k - 1];
+    let j = k + 1;
+    while (j < s.length && s[j] === r) j++;
+    if (before !== ' ' && before !== '\t' && before !== '\n' && before !== '\r' && before !== '\f') v = k;
+    k = j - 1;
+  }
+  return v;
+}
+
+// Classify a delimiter run of `r` at s[start..start+len) into marked's
+// RDelim groups (GFM flavour): 1/2 are closers, 3/4 openers, 5/6
+// ambiguous; 0 means the run is not a delimiter at all here (e.g.
+// surrounded by spaces, or at the start of the text). Group 3 takes
+// punct-or-space before the run (not space only). NOTE: the `_`
+// closer regex has only five groups — there is NO group 6 for `_`,
+// so an intraword `_` run (non-punct-non-space on both sides) is not
+// a delimiter at all, while `*` does have a group 6.
+function classifyEmRun(s, start, len, r) {
+  const before = start > 0 ? s[start - 1] : '';
+  const after = start + len < s.length ? s[start + len] : '';
+  // `*` uses the GFM classes (punct excludes `~`, nps includes it);
+  // `_` uses the normal classes (punct includes `~`, nps excludes it).
+  const pu = r === '*' ? isEmPunct : (ch) => ch !== '' && isUniPunct(ch);
+  const nps = r === '*' ? isEmNps : (ch) => ch !== '' && !isUniSpace(ch) && !isUniPunct(ch);
+  const ps = r === '*' ? isEmPunctSpace : (ch) => ch !== '' && (isUniSpace(ch) || isUniPunct(ch));
+  const beforePu = pu(before);
+  const beforePs = ps(before);
+  const beforeNps = nps(before);
+  const afterPu = pu(after);
+  const afterWs = after === '' || isUniSpace(after);
+  const afterPs = after === '' || ps(after);
+  const afterNps = nps(after);
+  if (beforePu && afterWs) return 1;
+  if (beforeNps && afterPs) return 2;
+  if (beforePs && afterNps) return 3;
+  if (before !== '' && isUniSpace(before) && afterPu) return 4;
+  if (beforePu && afterPu) return 5;
+  if (beforeNps && afterNps) return r === '_' ? 0 : 6;
+  return 0;
+}
+
+// Skip marked's `__...*...__` (for `*` closers) / `**..._...**`
+// (for `_` closers) alternative at the start of the scan: the
+// delimiter inside that pattern is not a closer candidate. Returns
+// the index to continue scanning from (just before the closing
+// marker), or `start` when the pattern does not match.
+function skipEmPattern(t, start, r) {
+  const open = r === '*' ? '__' : '**';
+  const inner = r === '*' ? '*' : '_';
+  let a = t.indexOf(open, start);
+  if (a < 0) return start;
+  for (let k = start; k < a; k++) if (t[k] === '*' || t[k] === '_') return start;
+  let b = t.indexOf(inner, a + 2);
+  if (b < 0) return start;
+  for (let k = a + 2; k < b; k++) if (t[k] === '*' || t[k] === '_') return start;
+  let c = t.indexOf(open, b + 1);
+  if (c < 0) return start;
+  for (let k = b + 1; k < c; k++) if (t[k] === '*' || t[k] === '_') return start;
+  return c;
+}
+
+// Try marked's emStrong at the `*`/`_` run starting at s[i].
+// `t` is the masked source (code spans/links/HTML hidden); indices in
+// `t` match those in `s`, so the returned span is sliced from `s`.
+// Returns {tag, rawLen, inner} or null.
+function tryEmStrong(s, t, i) {
+  const r = s[i];
+  let j = i;
+  while (j < s.length && s[j] === r) j++;
+  const k = j - i;
+  const after = j < s.length ? s[j] : '';
+  // LDelim gate: the run must be followed by a character that is not a
+  // space and not the end of the text.
+  if (after === '' || isUniSpace(after)) return null;
+  // GFM LDelim: `d` is set when the character after the run is punct
+  // (excluding `~`); there is no open-quote exclusion.
+  const d = isEmPunct(after);
+  const prev = i > 0 ? s[i - 1] : '';
+  const o = prev === r;
+  let l = i;
+  while (l > 0 && t[l - 1] === r) l--;
+  const p = l > 0 ? t[l - 1] : '';
+  // marked's `punctuation` is punct-or-space (not just punct).
+  const pPuSp = p !== '' && (isUniSpace(p) || isUniPunct(p));
+  const h = p === '*' || p === '_' || pPuSp;
+  const n = l < i ? p : prev;
+  const u = l < i ? h : (n !== '' && n !== '*' && n !== '_' && (isUniSpace(n) || isUniPunct(n)));
+  // Intraword `_`: followed by a non-punct non-space char and
+  // preceded by an alphanumeric char.
+  if (r === '_' && after !== '' && !isUniSpace(after) && !isEmPunct(after) && isEmAlnum(n)) return null;
+  // Opener gate: proceed only when there is no punct after the run,
+  // or no character before it, or the character before is punct/space.
+  if (d && n !== '' && !u) return null;
+  const y = (i - l) + k;
+  const R = p !== '' && !isUniSpace(p) && (d || (r === '*' && !h));
+  const v = lastPossibleCloser(t, r);
+  const Q = i + k;
+  if (v < Q) return null;
+  let m = k, f = 0;
+  // The `__...*...__` / `**..._...**` skip applies at the start of
+  // the scan only (the regex alternative is `^`-anchored).
+  let pos = skipEmPattern(t, Q, r);
+  for (;;) {
+    const next = t.indexOf(r, pos);
+    if (next < 0) return null;
+    pos = next;
+    // An escaped delimiter (`\*`) is not a delimiter: marked masks it.
+    let bs = 0;
+    for (let b = pos - 1; b >= 0 && s[b] === '\\'; b--) bs++;
+    if (bs % 2 === 1) { pos++; continue; }
+    let e = pos;
+    while (e < t.length && t[e] === r) e++;
+    const runLen = e - pos;
+    // Scan limit: only runs whose match start (pos - 1) is <= v.
+    if (pos - 1 > v) return null;
+    const g = classifyEmRun(t, pos, runLen, r);
+    if (g === 0) { pos = e; continue; }
+    const b = runLen;
+    if (g === 3 || g === 4) { m += b; pos = e; continue; }
+    if (g === 5 || g === 6 || R) {
+      if (o && (g === 5 || g === 6)) return null;
+      if (y % 3 !== 0 && (y + b) % 3 === 0) { f += b; pos = e; continue; }
+    }
+    m -= b;
+    if (m > 0) { pos = e; continue; }
+    const bb = Math.min(b, b + m + f);
+    const rawEnd = pos + bb;
+    const strip = Math.min(k, bb) % 2 === 1 ? 1 : 2;
+    return {
+      tag: strip === 1 ? 'em' : 'strong',
+      rawLen: rawEnd - i,
+      inner: s.slice(i + strip, rawEnd - strip),
+    };
+  }
+}
+
 function parseInline(s, refs, noGfm) {
   const items = [];
   let text = '';
   const flush = () => { if (text) { items.push({ t: 'text', s: text }); text = ''; } };
+  // The masked source for the emStrong scan (computed lazily, only
+  // when the text contains an emphasis delimiter).
+  let masked = null;
+  const getMasked = () => (masked ??= maskEmSource(s, refs));
   const n = s.length;
   let i = 0;
   while (i < n) {
@@ -1504,23 +1862,30 @@ function parseInline(s, refs, noGfm) {
       continue;
     }
     if (c === '*' || c === '_' || c === '~') {
+      if (c === '*' || c === '_') {
+        // marked's opener-driven emStrong: try to pair this run by
+        // scanning forward. On a match, the inner text is lexed
+        // recursively (so nested emphasis/links resolve inside it).
+        // On failure, one character is literal text and the scan is
+        // retried at the next character (the run, now one shorter).
+        const em = tryEmStrong(s, getMasked(), i);
+        if (em) {
+          flush();
+          const kids = parseInline(em.inner, refs, noGfm);
+          items.push({ t: em.tag, children: kids });
+          i += em.rawLen;
+          continue;
+        }
+        text += c; i++;
+        continue;
+      }
       let j = i;
       while (j < n && s[j] === c) j++;
       const len = j - i;
       const fl = flanking(s, i, j);
-      let canOpen, canClose;
-      if (c === '*') {
-        // '*' may open/close intraword; '_' may not.
-        canOpen = fl.left;
-        canClose = fl.right;
-      } else if (c === '_') {
-        canOpen = fl.left && (!fl.right || (i > 0 && isUniPunct(s[i - 1])));
-        canClose = fl.right && (!fl.left || (j < n && isUniPunct(s[j])));
-      } else {
-        // A tilde run of 3+ is not a strikethrough delimiter.
-        canOpen = len < 3 && fl.left;
-        canClose = len < 3 && fl.right;
-      }
+      // A tilde run of 3+ is not a strikethrough delimiter.
+      const canOpen = len < 3 && fl.left;
+      const canClose = len < 3 && fl.right;
       flush();
       items.push({ t: 'delim', ch: c, len, canOpen, canClose });
       i = j;
@@ -1538,7 +1903,18 @@ function parseInline(s, refs, noGfm) {
         }
       }
       const he = matchInlineHtml(s, i);
-      if (he > 0) { flush(); items.push({ t: 'html', s: s.slice(i, he) }); i = he; continue; }
+      if (he > 0) {
+        flush();
+        const tagText = s.slice(i, he);
+        // An opening `<a ...>` tag (a space must follow `<a`) enters
+        // "inside a link" mode; a closing `</a>` leaves it. The mode
+        // persists across blocks (see inlineInLink).
+        if (!inlineInLink && /^<a /i.test(tagText)) inlineInLink = true;
+        else if (inlineInLink && /^<\/a>/i.test(tagText)) inlineInLink = false;
+        items.push({ t: 'html', s: tagText });
+        i = he;
+        continue;
+      }
       text += c; i++;
       continue;
     }
@@ -1571,7 +1947,12 @@ function parseInline(s, refs, noGfm) {
       if (dest === null) { text += c; i++; continue; }
       const href = cleanUrl(dest);
       if (href === null) { text += c; i++; continue; }
+      // A link label is lexed with autolinks suppressed (noGfm); any
+      // `<a>` tag inside it must not leak into the persistent inLink
+      // state (marked restores inLink after lexing a label).
+      const savedInLink = inlineInLink;
       const kids = parseInline(labelText, refs, true);
+      inlineInLink = savedInLink;
       if (!isImg && containsLink(kids)) { text += c; i++; continue; }
       flush();
       if (isImg) {
@@ -1584,10 +1965,12 @@ function parseInline(s, refs, noGfm) {
     }
     // GFM extended autolinks: www. / email / bare scheme URL, at a word
     // boundary only. They are not recognised inside link text (marked
-    // leaves a bare URL/email/www. there as plain text). A '_' before
-    // the address is a boundary too when it is an emphasis delimiter
-    // (not preceded by an alphanumeric, i.e. not intraword).
-    if (!noGfm && /[A-Za-z0-9]/.test(c) && (i === 0 || !/[A-Za-z0-9_]/.test(s[i - 1]) || (s[i - 1] === '_' && (i < 2 || !/[A-Za-z0-9]/.test(s[i - 2]))))) {
+    // leaves a bare URL/email/www. there as plain text), nor while an
+    // unclosed `<a>` tag has put the lexer in "inside a link" mode.
+    // A '_' before the address is a boundary too when it is an
+    // emphasis delimiter (not preceded by an alphanumeric, i.e. not
+    // intraword).
+    if (!noGfm && !inlineInLink && /[A-Za-z0-9]/.test(c) && (i === 0 || !/[A-Za-z0-9_]/.test(s[i - 1]) || (s[i - 1] === '_' && (i < 2 || !/[A-Za-z0-9]/.test(s[i - 2]))))) {
       const g = matchGfmAutolink(s, i);
       if (g) {
         const href = cleanUrl(g.href);
@@ -1703,6 +2086,9 @@ function renderInline(items) {
 function tableDelimiter(line) {
   const m = line.match(/^ {0,3}(\|?((?: *:?-+:? *\|)+ *:?-+:? *| *:?-+:? *)\|?)[ \t]*$/);
   if (!m) return null;
+  // Marked's tableDelimiter test: the delimiter must contain a ':'
+  // or a '|' — a bare `---` is a setext underline, not a delimiter.
+  if (!/[:|]/.test(m[1])) return null;
   let inner = m[1].trim();
   if (inner.startsWith('|')) inner = inner.slice(1);
   if (inner.endsWith('|')) inner = inner.slice(0, -1);
@@ -1719,40 +2105,21 @@ function tableDelimiter(line) {
   return aligns;
 }
 
-// Split a table row into cells, honouring escaped pipes and code spans.
+// Split a table row into cells, mirroring marked: only backslash-
+// escaped pipes are protected — a pipe inside a code span DOES split
+// the cell. An unescaped pipe is marked by inserting a space before
+// it, then the row is split on " |"; a leading/trailing empty cell is
+// dropped, and each cell is trimmed with `\|` unescaped to `|`.
 function splitCells(row) {
-  const cells = [];
-  let cur = '', i = 0;
-  while (i < row.length) {
-    const c = row[i];
-    if (c === '\\' && i + 1 < row.length && row[i + 1] === '|') {
-      // An escaped pipe is a literal pipe (the backslash is consumed
-      // while splitting, so it never reaches a code span).
-      cur += '|'; i += 2; continue;
-    }
-    if (c === '`') {
-      let j = i;
-      while (j < row.length && row[j] === '`') j++;
-      const run = j - i;
-      let k = j, found = -1;
-      while (k < row.length) {
-        if (row[k] === '`') {
-          let e = k;
-          while (e < row.length && row[e] === '`') e++;
-          if (e - k === run) { found = e; break; }
-          k = e;
-        } else k++;
-      }
-      if (found >= 0) { cur += row.slice(i, found).replace(/\\\|/g, '|'); i = found; continue; }
-      cur += row.slice(i, j); i = j; continue;
-    }
-    if (c === '|') { cells.push(cur.trim()); cur = ''; i++; continue; }
-    cur += c; i++;
-  }
-  cells.push(cur.trim());
-  if (cells.length && cells[0] === '') cells.shift();
-  if (cells.length && cells[cells.length - 1] === '') cells.pop();
-  return cells;
+  const t = row.replace(/\|/g, (r, o, s) => {
+    let escaped = false, p = o;
+    while (--p >= 0 && s[p] === '\\') escaped = !escaped;
+    return escaped ? '|' : ' |';
+  });
+  const cells = t.split(/ \|/);
+  if (cells.length && !cells[0].trim()) cells.shift();
+  if (cells.length && !cells[cells.length - 1].trim()) cells.pop();
+  return cells.map((c) => c.trim().replace(/\\\|/g, '|'));
 }
 
 // Try to interpret a paragraph block as a GFM table. Returns true when
@@ -1762,6 +2129,16 @@ function splitCells(row) {
 // tab-only line inside a table is kept as an empty row.
 function isTableCandidate(lines) {
   if (lines.length < 2 || lines[0].indexOf('|') < 0) return false;
+  const aligns = tableDelimiter(lines[1]);
+  if (!aligns) return false;
+  return splitCells(lines[0]).length === aligns.length;
+}
+
+// True when the paragraph lines so far form a table header + delimiter
+// (the table rule is tried before the setext rule, so a setext-looking
+// line after a table header is a row, not a heading).
+function isTableHeader(lines) {
+  if (lines.length < 2) return false;
   const aligns = tableDelimiter(lines[1]);
   if (!aligns) return false;
   return splitCells(lines[0]).length === aligns.length;
