@@ -1518,6 +1518,49 @@ function containsLink(items) {
   return false;
 }
 
+// Try marked's del at the `~` run starting at s[i] (opener-driven,
+// mirroring tryEmStrong and marked's del tokenizer): the opener is a
+// run of 1-2 tildes followed by a non-space non-`~` char; scan the
+// masked source for a closer run of the same length, counting inner
+// opener runs (groups 3/4) so nested `~~` pairs close at the right
+// place. Returns {rawLen, inner} or null.
+function tryDel(s, t, i) {
+  let j = i;
+  while (j < s.length && s[j] === '~') j++;
+  const o = j - i;
+  if (o > 2) return null;
+  const after = j < s.length ? s[j] : '';
+  // delLDelim: the char after the opener must be non-space, non-`~`.
+  if (after === '' || isUniSpace(after) || after === '~') return null;
+  // LDelim gate (marked's del tokenizer): when the char after the
+  // opener is punctuation, the previous char must be absent or
+  // punctuation/space.
+  const d = isEmPunct(after);
+  const prev = i > 0 ? s[i - 1] : '';
+  const prevPuSp = prev !== '' && (isUniSpace(prev) || isUniPunct(prev));
+  if (d && prev !== '' && !prevPuSp) return null;
+  const v = lastPossibleCloser(t, '~');
+  if (v < j) return null;
+  let p = o;
+  let pos = j;
+  for (;;) {
+    const next = t.indexOf('~', pos);
+    if (next < 0) return null;
+    pos = next;
+    let e = pos;
+    while (e < t.length && t[e] === '~') e++;
+    const runLen = e - pos;
+    // Scan limit: only runs whose match start (pos - 1) is <= v.
+    if (pos - 1 > v) return null;
+    const g = classifyEmRun(t, pos, runLen, '*');
+    if (g === 0 || runLen !== o) { pos = e; continue; }
+    if (g === 3 || g === 4) { p += runLen; pos = e; continue; }
+    p -= runLen;
+    if (p > 0) { pos = e; continue; }
+    return { rawLen: pos + runLen - i, inner: s.slice(i + o, pos) };
+  }
+}
+
 // Scan inline content into a flat item list, then resolve emphasis.
 // Persistent "inside a link" state for GFM autolinks, mirroring
 // marked: an opening `<a ...>` tag (inline) sets it, a closing `</a>`
@@ -1862,6 +1905,22 @@ function parseInline(s, refs, noGfm) {
       continue;
     }
     if (c === '*' || c === '_' || c === '~') {
+      if (c === '~') {
+        // marked's del tokenizer (opener-driven, mirroring
+        // tryEmStrong): on a match the inner text is lexed
+        // recursively, so e.g. a `**` closer inside it sits at the
+        // end of the inner string instead of being followed by `~~`
+        // — that is why the flat delimiter model left `**` literal
+        // inside `<del>` (doc-06, doc-19). On no match, fall through
+        // to the flat delimiter handling below.
+        const dm = tryDel(s, getMasked(), i);
+        if (dm) {
+          flush();
+          items.push({ t: 'del', children: parseInline(dm.inner, refs, noGfm) });
+          i += dm.rawLen;
+          continue;
+        }
+      }
       if (c === '*' || c === '_') {
         // marked's opener-driven emStrong: try to pair this run by
         // scanning forward. On a match, the inner text is lexed
